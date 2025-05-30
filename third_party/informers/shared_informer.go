@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/kcp-dev/logicalcluster/v3"
+	"k8s.io/utils/ptr"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -58,19 +59,41 @@ func NewSharedInformer(lw cache.ListerWatcher, exampleObject runtime.Object, def
 // defaultEventHandlerResyncPeriod given here and (b) the constant
 // `minimumResyncPeriod` defined in this file.
 func NewSharedIndexInformer(lw cache.ListerWatcher, exampleObject runtime.Object, defaultEventHandlerResyncPeriod time.Duration, indexers cache.Indexers) kcpcache.ScopeableSharedIndexInformer {
+	return NewSharedIndexInformerWithOptions(
+		lw,
+		exampleObject,
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: defaultEventHandlerResyncPeriod,
+			Indexers:     indexers,
+		},
+	)
+}
+
+// NewSharedIndexInformerWithOptions creates a new instance for the ListerWatcher.
+// The created informer will not do resyncs if options.ResyncPeriod is zero.  Otherwise: for each
+// handler that with a non-zero requested resync period, whether added
+// before or after the informer starts, the nominal resync period is
+// the requested resync period rounded up to a multiple of the
+// informer's resync checking period.  Such an informer's resync
+// checking period is established when the informer starts running,
+// and is the maximum of (a) the minimum of the resync periods
+// requested before the informer starts and the
+// options.ResyncPeriod given here and (b) the constant
+// `minimumResyncPeriod` defined in this file.
+func NewSharedIndexInformerWithOptions(lw cache.ListerWatcher, exampleObject runtime.Object, options cache.SharedIndexInformerOptions) kcpcache.ScopeableSharedIndexInformer {
 	realClock := &clock.RealClock{}
-	sharedIndexInformer := &sharedIndexInformer{
-		processor: &sharedProcessor{clock: realClock},
-		// KCP modification: We changed the keyfunction passed to NewIndexer
-		indexer:                         cache.NewIndexer(kcpcache.MetaClusterNamespaceKeyFunc, indexers),
+
+	return &sharedIndexInformer{
+		indexer:                         cache.NewIndexer(kcpcache.MetaClusterNamespaceKeyFunc, options.Indexers),
+		processor:                       &sharedProcessor{clock: realClock},
 		listerWatcher:                   lw,
 		objectType:                      exampleObject,
-		resyncCheckPeriod:               defaultEventHandlerResyncPeriod,
-		defaultEventHandlerResyncPeriod: defaultEventHandlerResyncPeriod,
+		objectDescription:               options.ObjectDescription,
+		resyncCheckPeriod:               options.ResyncPeriod,
+		defaultEventHandlerResyncPeriod: options.ResyncPeriod,
 		cacheMutationDetector:           cache.NewCacheMutationDetector(fmt.Sprintf("%T", exampleObject)),
 		clock:                           realClock,
 	}
-	return sharedIndexInformer
 }
 
 const (
@@ -109,6 +132,9 @@ type sharedIndexInformer struct {
 	// `"apiVersion"` and `"kind"` must also be right.
 	objectType runtime.Object
 
+	// objectDescription is the description of this informer's objects. This typically defaults to
+	objectDescription string
+
 	// resyncCheckPeriod is how often we want the reflector's resync timer to fire so it can call
 	// shouldResync to check if any of our listeners need a resync.
 	resyncCheckPeriod time.Duration
@@ -127,7 +153,7 @@ type sharedIndexInformer struct {
 	blockDeltas sync.Mutex
 
 	// Called whenever the ListAndWatch drops the connection with an error.
-	watchErrorHandler cache.WatchErrorHandler
+	watchErrorHandler cache.WatchErrorHandlerWithContext
 
 	transform cache.TransformFunc
 }
@@ -147,6 +173,9 @@ func (s *sharedIndexInformer) ClusterWithContext(ctx context.Context, cluster lo
 // notice any change in behavior.
 type dummyController struct {
 	informer *sharedIndexInformer
+}
+
+func (v *dummyController) RunWithContext(ctx context.Context) {
 }
 
 func (v *dummyController) Run(stopCh <-chan struct{}) {
@@ -179,6 +208,12 @@ type deleteNotification struct {
 }
 
 func (s *sharedIndexInformer) SetWatchErrorHandler(handler cache.WatchErrorHandler) error {
+	return s.SetWatchErrorHandlerWithContext(func(_ context.Context, r *cache.Reflector, err error) {
+		handler(r, err)
+	})
+}
+
+func (s *sharedIndexInformer) SetWatchErrorHandlerWithContext(handler cache.WatchErrorHandlerWithContext) error {
 	s.startedLock.Lock()
 	defer s.startedLock.Unlock()
 
@@ -201,31 +236,32 @@ func (s *sharedIndexInformer) SetTransform(handler cache.TransformFunc) error {
 	s.transform = handler
 	return nil
 }
-
-func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
-	defer utilruntime.HandleCrash()
+func (s *sharedIndexInformer) RunWithContext(ctx context.Context) {
+	defer utilruntime.HandleCrashWithContext(ctx)
+	logger := klog.FromContext(ctx)
 
 	if s.HasStarted() {
-		klog.Warningf("The sharedIndexInformer has started, run more than once is not allowed")
+		logger.Info("Warning: the sharedIndexInformer has started, run more than once is not allowed")
 		return
 	}
+
 	fifo := cache.NewDeltaFIFOWithOptions(cache.DeltaFIFOOptions{
 		KnownObjects:          s.indexer,
 		EmitDeltaTypeReplaced: true,
-		// KCP modification: We changed the keyfunction passed to NewDeltaFIFOWithOptions
-		KeyFunction: kcpcache.MetaClusterNamespaceKeyFunc,
+		Transformer:           s.transform,
+		KeyFunction:           kcpcache.MetaClusterNamespaceKeyFunc,
 	})
 
 	cfg := &cache.Config{
-		Queue:            fifo,
-		ListerWatcher:    s.listerWatcher,
-		ObjectType:       s.objectType,
-		FullResyncPeriod: s.resyncCheckPeriod,
-		RetryOnError:     false,
-		ShouldResync:     s.processor.shouldResync,
+		Queue:             fifo,
+		ListerWatcher:     s.listerWatcher,
+		ObjectType:        s.objectType,
+		ObjectDescription: s.objectDescription,
+		FullResyncPeriod:  s.resyncCheckPeriod,
+		ShouldResync:      s.processor.shouldResync,
 
-		Process:           s.HandleDeltas,
-		WatchErrorHandler: s.watchErrorHandler,
+		Process:                      s.HandleDeltas,
+		WatchErrorHandlerWithContext: s.watchErrorHandler,
 	}
 
 	func() {
@@ -235,24 +271,29 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 		s.controller = cache.New(cfg)
 
 		// KCP modification: we removed setting the s.controller.clock here as it's an unexported field we can't access
-
 		s.started = true
 	}()
 
-	// Separate stop channel because Processor should be stopped strictly after controller
-	processorStopCh := make(chan struct{})
+	// Separate stop context because Processor should be stopped strictly after controller.
+	// Cancelation in the parent context is ignored and all values are passed on,
+	// including - but not limited to - a logger.
+	processorStopCtx, stopProcessor := context.WithCancelCause(context.WithoutCancel(ctx))
 	var wg wait.Group
-	defer wg.Wait()              // Wait for Processor to stop
-	defer close(processorStopCh) // Tell Processor to stop
-	wg.StartWithChannel(processorStopCh, s.cacheMutationDetector.Run)
-	wg.StartWithChannel(processorStopCh, s.processor.run)
+	defer wg.Wait()                                         // Wait for Processor to stop
+	defer stopProcessor(errors.New("informer is stopping")) // Tell Processor to stop
+	wg.StartWithChannel(processorStopCtx.Done(), s.cacheMutationDetector.Run)
+	wg.StartWithContext(processorStopCtx, s.processor.run)
 
 	defer func() {
 		s.startedLock.Lock()
 		defer s.startedLock.Unlock()
 		s.stopped = true // Don't want any new listeners
 	}()
-	s.controller.Run(stopCh)
+	s.controller.RunWithContext(ctx)
+}
+
+func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
+	s.RunWithContext(wait.ContextForChannel(stopCh))
 }
 
 func (s *sharedIndexInformer) HasStarted() bool {
@@ -304,8 +345,68 @@ func (s *sharedIndexInformer) GetController() cache.Controller {
 	return &dummyController{informer: s}
 }
 
+func (s *sharedIndexInformer) AddEventHandlerWithOptions(handler cache.ResourceEventHandler, options cache.HandlerOptions) (cache.ResourceEventHandlerRegistration, error) {
+	s.startedLock.Lock()
+	defer s.startedLock.Unlock()
+
+	if s.stopped {
+		return nil, fmt.Errorf("handler %v was not added to shared informer because it has stopped already", handler)
+	}
+
+	logger := ptr.Deref(options.Logger, klog.Background())
+	resyncPeriod := ptr.Deref(options.ResyncPeriod, s.defaultEventHandlerResyncPeriod)
+	if resyncPeriod > 0 {
+		if resyncPeriod < minimumResyncPeriod {
+			logger.Info("Warning: resync period is too small. Changing it to the minimum allowed value", "resyncPeriod", resyncPeriod, "minimumResyncPeriod", minimumResyncPeriod)
+			resyncPeriod = minimumResyncPeriod
+		}
+
+		if resyncPeriod < s.resyncCheckPeriod {
+			if s.started {
+				logger.Info("Warning: resync period is smaller than resync check period and the informer has already started. Changing it to the resync check period", "resyncPeriod", resyncPeriod, "resyncCheckPeriod", s.resyncCheckPeriod)
+
+				resyncPeriod = s.resyncCheckPeriod
+			} else {
+				// if the event handler's resyncPeriod is smaller than the current resyncCheckPeriod, update
+				// resyncCheckPeriod to match resyncPeriod and adjust the resync periods of all the listeners
+				// accordingly
+				s.resyncCheckPeriod = resyncPeriod
+				s.processor.resyncCheckPeriodChanged(resyncPeriod)
+			}
+		}
+	}
+
+	listener := newProcessListener(logger, handler, resyncPeriod, determineResyncPeriod(resyncPeriod, s.resyncCheckPeriod), s.clock.Now(), initialBufferSize, s.HasSynced)
+
+	if !s.started {
+		return s.processor.addListener(listener), nil
+	}
+
+	// in order to safely join, we have to
+	// 1. stop sending add/update/delete notifications
+	// 2. do a list against the store
+	// 3. send synthetic "Add" events to the new handler
+	// 4. unblock
+	s.blockDeltas.Lock()
+	defer s.blockDeltas.Unlock()
+
+	handle := s.processor.addListener(listener)
+	for _, item := range s.indexer.List() {
+		// Note that we enqueue these notifications with the lock held
+		// and before returning the handle. That means there is never a
+		// chance for anyone to call the handle's HasSynced method in a
+		// state when it would falsely return true (i.e., when the
+		// shared informer is synced but it has not observed an Add
+		// with isInitialList being true, nor when the thread
+		// processing notifications somehow goes faster than this
+		// thread adding them and the counter is temporarily zero).
+		listener.add(addNotification{newObj: item, isInInitialList: true})
+	}
+	return handle, nil
+}
+
 func (s *sharedIndexInformer) AddEventHandler(handler cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
-	return s.AddEventHandlerWithResyncPeriod(handler, s.defaultEventHandlerResyncPeriod)
+	return s.AddEventHandlerWithOptions(handler, cache.HandlerOptions{})
 }
 
 func determineResyncPeriod(desired, check time.Duration) time.Duration {
@@ -326,53 +427,7 @@ func determineResyncPeriod(desired, check time.Duration) time.Duration {
 const minimumResyncPeriod = 1 * time.Second
 
 func (s *sharedIndexInformer) AddEventHandlerWithResyncPeriod(handler cache.ResourceEventHandler, resyncPeriod time.Duration) (cache.ResourceEventHandlerRegistration, error) {
-	s.startedLock.Lock()
-	defer s.startedLock.Unlock()
-
-	if s.stopped {
-		return nil, fmt.Errorf("handler %v was not added to shared informer because it has stopped already", handler)
-	}
-
-	if resyncPeriod > 0 {
-		if resyncPeriod < minimumResyncPeriod {
-			klog.Warningf("resyncPeriod %v is too small. Changing it to the minimum allowed value of %v", resyncPeriod, minimumResyncPeriod)
-			resyncPeriod = minimumResyncPeriod
-		}
-
-		if resyncPeriod < s.resyncCheckPeriod {
-			if s.started {
-				klog.Warningf("resyncPeriod %v is smaller than resyncCheckPeriod %v and the informer has already started. Changing it to %v", resyncPeriod, s.resyncCheckPeriod, s.resyncCheckPeriod)
-				resyncPeriod = s.resyncCheckPeriod
-			} else {
-				// if the event handler's resyncPeriod is smaller than the current resyncCheckPeriod, update
-				// resyncCheckPeriod to match resyncPeriod and adjust the resync periods of all the listeners
-				// accordingly
-				s.resyncCheckPeriod = resyncPeriod
-				s.processor.resyncCheckPeriodChanged(resyncPeriod)
-			}
-		}
-	}
-
-	listener := newProcessListener(handler, resyncPeriod, determineResyncPeriod(resyncPeriod, s.resyncCheckPeriod), s.clock.Now(), initialBufferSize, func() bool { return true })
-
-	if !s.started {
-		return s.processor.addListener(listener), nil
-	}
-
-	// in order to safely join, we have to
-	// 1. stop sending add/update/delete notifications
-	// 2. do a list against the store
-	// 3. send synthetic "Add" events to the new handler
-	// 4. unblock
-	s.blockDeltas.Lock()
-	defer s.blockDeltas.Unlock()
-
-	handle := s.processor.addListener(listener)
-	for _, item := range s.indexer.List() {
-		listener.add(addNotification{newObj: item})
-	}
-
-	return handle, nil
+	return s.AddEventHandlerWithOptions(handler, cache.HandlerOptions{ResyncPeriod: &resyncPeriod})
 }
 
 func (s *sharedIndexInformer) HandleDeltas(obj interface{}, isInInitialList bool) error {
@@ -534,7 +589,7 @@ func (p *sharedProcessor) distribute(obj interface{}, sync bool) {
 	}
 }
 
-func (p *sharedProcessor) run(stopCh <-chan struct{}) {
+func (p *sharedProcessor) run(ctx context.Context) {
 	func() {
 		p.listenersLock.RLock()
 		defer p.listenersLock.RUnlock()
@@ -544,7 +599,7 @@ func (p *sharedProcessor) run(stopCh <-chan struct{}) {
 		}
 		p.listenersStarted = true
 	}()
-	<-stopCh
+	<-ctx.Done()
 
 	p.listenersLock.Lock()
 	defer p.listenersLock.Unlock()
@@ -641,6 +696,7 @@ type processorListener struct {
 	nextResync time.Time
 	// resyncLock guards access to resyncPeriod and nextResync
 	resyncLock sync.Mutex
+	logger     klog.Logger
 }
 
 // HasSynced returns true if the source informer has synced, and all
@@ -649,8 +705,9 @@ func (p *processorListener) HasSynced() bool {
 	return p.syncTracker.HasSynced()
 }
 
-func newProcessListener(handler cache.ResourceEventHandler, requestedResyncPeriod, resyncPeriod time.Duration, now time.Time, bufferSize int, hasSynced func() bool) *processorListener {
+func newProcessListener(logger klog.Logger, handler cache.ResourceEventHandler, requestedResyncPeriod, resyncPeriod time.Duration, now time.Time, bufferSize int, hasSynced func() bool) *processorListener {
 	ret := &processorListener{
+		logger:                logger,
 		nextCh:                make(chan interface{}),
 		addCh:                 make(chan interface{}),
 		handler:               handler,
@@ -755,7 +812,7 @@ func (p *processorListener) setResyncPeriod(resyncPeriod time.Duration) {
 // taken from k8s.io/client-go/tools/cache/controller.go
 // KCP modification: we added this function from controller.go
 func processDeltas(
-	// Object which receives event notifications from the given deltas
+// Object which receives event notifications from the given deltas
 	handler cache.ResourceEventHandler,
 	clientState cache.Store,
 	transformer cache.TransformFunc,
